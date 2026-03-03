@@ -279,6 +279,15 @@ Can be one of:
                  (const :tag "No header" nil))
   :group 'agent-shell)
 
+(defcustom agent-shell-show-session-id nil
+  "Non-nil to display the session ID in the header and session selection.
+
+When enabled, the session ID is shown after the directory path in the
+header and as an additional column in the session selection prompt.
+Only appears when a session is active."
+  :type 'boolean
+  :group 'agent-shell)
+
 (defcustom agent-shell-show-welcome-message t
   "Non-nil to show welcome message."
   :type 'boolean
@@ -865,6 +874,17 @@ Includes shells accessed via viewport buffers, preserving visited order."
   "Show `agent-shell' mode version."
   (interactive)
   (message "agent-shell v%s" agent-shell--version))
+
+(defun agent-shell-copy-session-id ()
+  "Copy the current session ID to the kill ring."
+  (interactive)
+  (unless (derived-mode-p 'agent-shell-mode)
+    (user-error "Not in a shell"))
+  (if-let (session-id (map-nested-elt (agent-shell--state) '(:session :id)))
+      (progn
+        (kill-new session-id)
+        (message "Copied session ID: %s" session-id))
+    (user-error "No active session")))
 
 (defun agent-shell-interrupt (&optional force)
   "Interrupt in-progress request and reject all pending permissions.
@@ -2673,6 +2693,13 @@ Returns:
 
 A buffer-local hash table mapping cache keys to header strings.")
 
+(defun agent-shell--session-id-indicator ()
+  "Return a propertized session ID string, or nil if unavailable or disabled."
+  (when-let* ((agent-shell-show-session-id)
+              (session-id (map-nested-elt (agent-shell--state) '(:session :id)))
+              ((not (string-empty-p session-id))))
+    (propertize session-id 'font-lock-face 'font-lock-constant-face)))
+
 (cl-defun agent-shell--make-header-model (state &key qualifier bindings)
   "Create a header model alist from STATE, QUALIFIER, and BINDINGS.
 The model contains all inputs needed to render the graphical header."
@@ -2695,6 +2722,7 @@ The model contains all inputs needed to render the graphical header."
       (:mode-id . ,mode-id)
       (:mode-name . ,mode-name)
       (:directory . ,default-directory)
+      (:session-id . ,(agent-shell--session-id-indicator))
       (:frame-width . ,(frame-pixel-width))
       (:font-height . ,(frame-char-height))
       (:font-size . ,(when-let* (((display-graphic-p))
@@ -2727,7 +2755,7 @@ BINDINGS is a list of alists defining key bindings to display, each with:
   (unless state
     (error "STATE is required"))
   (let* ((header-model (agent-shell--make-header-model state :qualifier qualifier :bindings bindings))
-         (text-header (format " %s%s%s @ %s%s%s"
+         (text-header (format " %s%s%s @ %s%s%s%s"
                               (propertize (concat (map-elt header-model :buffer-name) " Agent")
                                           'font-lock-face 'font-lock-variable-name-face)
                               (if (map-elt header-model :model-name)
@@ -2738,6 +2766,9 @@ BINDINGS is a list of alists defining key bindings to display, each with:
                                 "")
                               (propertize (string-remove-suffix "/" (abbreviate-file-name (map-elt header-model :directory)))
                                           'font-lock-face 'font-lock-string-face)
+                              (if (map-elt header-model :session-id)
+                                  (concat " ➤ " (map-elt header-model :session-id))
+                                "")
                               (if (map-elt header-model :context-indicator)
                                   (concat " " (map-elt header-model :context-indicator))
                                 "")
@@ -2850,10 +2881,30 @@ BINDINGS is a list of alists defining key bindings to display, each with:
                                                                     (map-elt header-model :busy-indicator-frame))))
                                       text-node))
                    ;; Bottom text line
-                   (svg-text svg (string-remove-suffix "/" (abbreviate-file-name (map-elt header-model :directory)))
-                             :x icon-text-x :y (+ icon-text-y text-height (- char-height font-size))
-                             :font-size font-size
-                             :fill (face-attribute 'font-lock-string-face :foreground))
+                   (svg--append svg (let ((text-node (dom-node 'text
+                                                               `((x . ,icon-text-x)
+                                                                 (y . ,(+ icon-text-y text-height (- char-height font-size)))
+                                                                 (font-size . ,font-size)))))
+                                      ;; Directory path
+                                      (dom-append-child text-node
+                                                        (dom-node 'tspan
+                                                                  `((fill . ,(face-attribute 'font-lock-string-face :foreground)))
+                                                                  (string-remove-suffix "/" (abbreviate-file-name (map-elt header-model :directory)))))
+                                      ;; Session ID (optional)
+                                      (when (map-elt header-model :session-id)
+                                        ;; Separator arrow (default foreground)
+                                        (dom-append-child text-node
+                                                          (dom-node 'tspan
+                                                                    `((fill . ,(face-attribute 'default :foreground))
+                                                                      (dx . "8"))
+                                                                    "➤"))
+                                        ;; Session ID text
+                                        (dom-append-child text-node
+                                                          (dom-node 'tspan
+                                                                    `((fill . ,(face-attribute 'font-lock-constant-face :foreground))
+                                                                      (dx . "8"))
+                                                                    (substring-no-properties (map-elt header-model :session-id)))))
+                                      text-node))
                    ;; Bindings row (last row if bindings or qualifier present)
                    (when (or bindings qualifier)
                      (svg--append svg (let ((text-node (dom-node 'text
@@ -3459,21 +3510,62 @@ for the current year, or \"Mon DD, YYYY\" for other years."
         (concat (substring title 0 47) "...")
       title)))
 
-(cl-defun agent-shell--session-choice-label (&key acp-session max-dir-width max-title-width)
+(defun agent-shell--session-column-value (column acp-session)
+  "Return the string value for COLUMN from ACP-SESSION.
+
+COLUMN is a symbol: `directory', `title', `date', or `session-id'.
+
+  (agent-shell--session-column-value
+   \\='directory
+   \\='((cwd . \"/home/user/project\")))
+  ;; => \"project\""
+  (pcase column
+    ('directory (agent-shell--session-dir-name acp-session))
+    ('title (agent-shell--session-title acp-session))
+    ('date (agent-shell--format-session-date
+            (or (map-elt acp-session 'updatedAt)
+                (map-elt acp-session 'createdAt)
+                "unknown-time")))
+    ('session-id (or (map-elt acp-session 'sessionId) ""))
+    (_ "")))
+
+(defun agent-shell--session-column-face (column)
+  "Return the face for COLUMN in the session selection prompt.
+
+  (agent-shell--session-column-face \\='directory)
+  ;; => `font-lock-keyword-face'"
+  (pcase column
+    ('directory 'font-lock-keyword-face)
+    ('date 'font-lock-comment-face)
+    ('session-id 'font-lock-constant-face)
+    (_ nil)))
+
+(defun agent-shell--session-selection-columns ()
+  "Return the list of columns for session selection.
+Always includes directory, title, and date.  Appends session-id
+when `agent-shell-show-session-id' is non-nil."
+  (if agent-shell-show-session-id
+      '(directory title date session-id)
+    '(directory title date)))
+
+(cl-defun agent-shell--session-choice-label (&key acp-session max-widths)
   "Return completion label for ACP-SESSION.
-MAX-DIR-WIDTH is the column width for the directory name.
-MAX-TITLE-WIDTH is the column width for the title."
-  (let* ((dir-name (agent-shell--session-dir-name acp-session))
-         (dir-padding (make-string (- (+ max-dir-width 1) (length dir-name)) ?\s))
-         (dir-col (propertize (concat dir-name dir-padding) 'face 'font-lock-keyword-face))
-         (title (agent-shell--session-title acp-session))
-         (title-padding (make-string (- (+ max-title-width 1) (length title)) ?\s))
-         (updated-at (or (map-elt acp-session 'updatedAt)
-                         (map-elt acp-session 'createdAt)
-                         "unknown-time"))
-         (date-str (propertize (agent-shell--format-session-date updated-at)
-                               'face 'font-lock-comment-face)))
-    (concat dir-col title title-padding date-str)))
+MAX-WIDTHS is an alist mapping column symbols to their max widths."
+  (let* ((columns (agent-shell--session-selection-columns))
+         parts
+         (last-col (car (last columns))))
+    (dolist (col columns)
+      (let* ((value (agent-shell--session-column-value col acp-session))
+             (face (agent-shell--session-column-face col))
+             (max-width (or (map-elt max-widths col) (length value)))
+             (padded (if (eq col last-col)
+                         value
+                       (let ((padding (make-string
+                                       (max 0 (- (+ max-width 1) (length value)))
+                                       ?\s)))
+                         (concat value padding)))))
+        (push (if face (propertize padded 'face face) padded) parts)))
+    (apply #'concat (nreverse parts))))
 
 (defun agent-shell--prompt-select-session (acp-sessions)
   "Prompt to choose one from ACP-SESSIONS.
@@ -3488,22 +3580,21 @@ Falls back to latest session in batch mode (e.g. tests)."
       (let* ((other-shells (seq-remove (lambda (b) (eq b (current-buffer)))
                                       (agent-shell-buffers)))
              (new-session-choice "Start new shell")
+             (columns (agent-shell--session-selection-columns))
+             (max-widths (when acp-sessions
+                          (mapcar (lambda (col)
+                                    (cons col (apply #'max
+                                                     (mapcar (lambda (s)
+                                                               (length (agent-shell--session-column-value col s)))
+                                                             acp-sessions))))
+                                  columns)))
              (session-choices (append (list (cons new-session-choice nil))
                               (when other-shells
                                 (list (cons "Open existing shell" :other-shell)))
                               (mapcar (lambda (acp-session)
                                         (cons (agent-shell--session-choice-label
                                                :acp-session acp-session
-                                               :max-dir-width
-                                               (when acp-sessions
-                                                 (apply #'max (mapcar (lambda (s)
-                                                                        (length (agent-shell--session-dir-name s)))
-                                                                      acp-sessions)))
-                                               :max-title-width
-                                               (when acp-sessions
-                                                 (apply #'max (mapcar (lambda (s)
-                                                                        (length (agent-shell--session-title s)))
-                                                                      acp-sessions))))
+                                               :max-widths max-widths)
                                               acp-session))
                                       acp-sessions)))
              (candidates (mapcar #'car session-choices))
