@@ -1224,7 +1224,8 @@ COMMAND, when present, may be a shell command string or an argv vector."
                 :text (format "## Agent's Thoughts (%s)\n\n" (format-time-string "%F %T"))
                 :file-path agent-shell--transcript-file))
              (agent-shell--append-transcript
-              :text (map-nested-elt acp-notification '(params update content text))
+              :text (agent-shell--indent-markdown-headers
+                     (map-nested-elt acp-notification '(params update content text)))
               :file-path agent-shell--transcript-file)
              (agent-shell--update-fragment
               :state state
@@ -1250,8 +1251,13 @@ COMMAND, when present, may be a shell command string or an argv vector."
                (agent-shell--append-transcript
                 :text (format "\n## Agent (%s)\n\n" (format-time-string "%F %T"))
                 :file-path agent-shell--transcript-file))
+             ;; Indent markdown headers in LLM output so they nest
+             ;; below the transcript's ## section headers.  Applied
+             ;; per-chunk: if a header is split across chunks it may
+             ;; not be indented (graceful degradation).
              (agent-shell--append-transcript
-              :text (map-nested-elt acp-notification '(params update content text))
+              :text (agent-shell--indent-markdown-headers
+                     (map-nested-elt acp-notification '(params update content text)))
               :file-path agent-shell--transcript-file)
              (agent-shell--update-fragment
               :state state
@@ -1273,7 +1279,9 @@ COMMAND, when present, may be a shell command string or an argv vector."
                 :text (format "## User (%s)\n\n" (format-time-string "%F %T"))
                 :file-path agent-shell--transcript-file))
              (agent-shell--append-transcript
-              :text (format "> %s\n" (map-nested-elt acp-notification '(params update content text)))
+              :text (format "> %s\n"
+                            (agent-shell--indent-markdown-headers
+                             (map-nested-elt acp-notification '(params update content text))))
               :file-path agent-shell--transcript-file)
              (agent-shell--update-text
               :state state
@@ -1373,11 +1381,11 @@ COMMAND, when present, may be a shell command string or an argv vector."
                          :output body-text)
                   :file-path agent-shell--transcript-file))
                ;; Hide permission after sending response.
-               ;; Status and permission are no longer pending. User
+               ;; Status is completed or failed so the user
                ;; likely selected one of: accepted/rejected/always.
                ;; Remove stale permission dialog.
-               (when (and (map-nested-elt acp-notification '(params update status))
-                          (not (equal (map-nested-elt acp-notification '(params update status)) "pending")))
+               (when (member (map-nested-elt acp-notification '(params update status))
+                             '("completed" "failed"))
                  ;; block-id must be the same as the one used as
                  ;; agent-shell--update-fragment param by "session/request_permission".
                  (agent-shell--delete-fragment :state state :block-id (format "permission-%s" (map-nested-elt acp-notification '(params update toolCallId)))))
@@ -1989,17 +1997,38 @@ For example, shut down ACP client."
   (agent-shell-heartbeat-stop
    :heartbeat (map-elt (agent-shell--state) :heartbeat)))
 
-(defun agent-shell--dot-subdir (subdir)
-  "Return path to .agent-shell/SUBDIR under project root, creating it if needed.
-When the directory is first created inside a git repo and
-.agent-shell/ is not yet ignored, automatically add it to .gitignore.
+(defcustom agent-shell-dot-subdir-function #'agent-shell--dot-subdir-in-repo
+  "Function used by `agent-shell--dot-subdir' to resolve subdirectory paths.
+Called with one argument, SUBDIR (a string such as \"screenshots\" or
+\"transcripts\"), and must return the absolute path to that subdirectory.
+Directory creation is handled by `agent-shell--dot-subdir', not by this
+function."
+  :type '(choice (const :tag "In repo (.agent-shell/)" agent-shell--dot-subdir-in-repo)
+                 (function :tag "Custom function"))
+  :group 'agent-shell)
+
+(defun agent-shell--dot-subdir-in-repo (subdir)
+  "Return path to .agent-shell/SUBDIR under the project root.
 
 For example:
 
-  (agent-shell--dot-subdir \"screenshots\")
-  => \"/path/to/project/.agent-shell/screenshots/\""
-  (let ((dir (expand-file-name (file-name-concat ".agent-shell" subdir)
-                               (agent-shell-cwd))))
+  (agent-shell--dot-subdir-in-repo \"screenshots\")
+  => \"/path/to/project/.agent-shell/screenshots\""
+  (expand-file-name (file-name-concat ".agent-shell" subdir)
+                    (agent-shell-cwd)))
+
+(defun agent-shell--dot-subdir (subdir)
+  "Return path to SUBDIR for agent-shell data, creating it if needed.
+Calls `agent-shell-dot-subdir-function' to resolve the path.
+When the directory is first created inside a git repo and
+.agent-shell/ is not yet ignored, automatically add it to .gitignore.
+This gitignore update is a one-time operation: if the entry is later
+removed from .gitignore it will not be re-added."
+  (unless (functionp agent-shell-dot-subdir-function)
+    (error "agent-shell-dot-subdir-function must be set to a function"))
+  (let ((dir (funcall agent-shell-dot-subdir-function subdir)))
+    (unless (and (stringp dir) (not (string-empty-p (string-trim dir))))
+      (error "Failed to resolve agent-shell data directory (subdir: %s). Resulting directory is not a non-empty string (dir: %s)" subdir dir))
     (unless (file-directory-p dir)
       (make-directory dir t)
       (agent-shell--ensure-gitignore (agent-shell-cwd)))
@@ -4095,7 +4124,7 @@ If FILE-PATH is not an image, returns nil."
     (agent-shell--append-transcript
      :text (format "## User (%s)\n\n%s\n\n"
                    (format-time-string "%F %T")
-                   prompt)
+                   (agent-shell--indent-markdown-headers prompt))
      :file-path agent-shell--transcript-file)
 
     (when-let ((viewport-buffer (agent-shell-viewport--buffer
@@ -5772,6 +5801,45 @@ Returns the file path, or nil if disabled."
         (error
          (message "Failed to initialize transcript: %S" err))))
     filepath))
+
+(defun agent-shell--indent-markdown-headers (text)
+  "Indent markdown headers in TEXT by 2 levels for transcript hierarchy.
+
+Increases the level of all markdown headers while leaving content
+inside code blocks unchanged.  Headers are capped at level 6
+since markdown doesn't support deeper levels.
+
+For example:
+
+  (agent-shell--indent-markdown-headers \"# Foo\")
+    => \"### Foo\"
+  (agent-shell--indent-markdown-headers \"##### Deep\")
+    => \"###### Deep\""
+  (unless (stringp text)
+    (setq text (or text "")))
+  (let ((lines (split-string text "\n"))
+        (in-code-block nil)
+        (result nil))
+    (dolist (line lines)
+      (cond
+       ;; Toggle code block state on fence lines (3+ backticks).
+       ((string-match "\\`\\(```+\\)" line)
+        (if in-code-block
+            (when (>= (length (match-string 1 line)) in-code-block)
+              (setq in-code-block nil))
+          (setq in-code-block (length (match-string 1 line))))
+        (push line result))
+       ;; Outside code blocks, indent header lines.
+       ((and (not in-code-block)
+             (string-match "\\`\\(#+\\) " line))
+        (let* ((hashes (match-string 1 line))
+               (new-level (min 6 (+ (length hashes) 2)))
+               (new-hashes (make-string new-level ?#)))
+          (push (replace-regexp-in-string "\\`#+ " (concat new-hashes " ") line)
+                result)))
+       (t (push line result))))
+    (mapconcat #'identity (nreverse result) "\n")))
+
 
 (cl-defun agent-shell--append-transcript (&key text file-path)
   "Append TEXT to the transcript at FILE-PATH."
