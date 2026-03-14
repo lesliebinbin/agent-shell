@@ -4485,7 +4485,23 @@ Uses AGENT-CWD to shorten file paths where necessary."
                      (agent-shell-ui-add-action-to-text
                       (propertize (concat "@" file)
                                   'display image-display
-                                  'pointer 'hand)
+                                  'pointer 'hand
+                                  'agent-shell-context-image t
+                                  'modification-hooks
+                                  ;; Delete entire image if any of it is deleted.
+                                  (list (lambda (edit-start edit-end)
+                                          (when-let (((get-text-property edit-start 'agent-shell-context-image))
+                                                     (image-start (or (previous-single-property-change
+                                                                       (1+ edit-start) 'agent-shell-context-image)
+                                                                      (point-min)))
+                                                     (image-end (or (next-single-property-change
+                                                                     edit-start 'agent-shell-context-image)
+                                                                    (point-max)))
+                                                     (inhibit-modification-hooks t))
+                                            (when (> image-end edit-end)
+                                              (delete-region edit-end image-end))
+                                            (when (< image-start edit-start)
+                                              (delete-region image-start edit-start))))))
                       (lambda ()
                         (interactive)
                         (find-file file))
