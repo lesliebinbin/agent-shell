@@ -4968,8 +4968,7 @@ MESSAGE-TEXT: Optional message to display after sending the response."
               :option-id option-id))
   ;; Kill any diff buffer opened for this tool call, suppressing the
   ;; on-exit callback since the permission is already being resolved.
-  (when-let* ((tool-data (map-elt (map-elt state :tool-calls) tool-call-id))
-              (diff-buf (map-elt tool-data :diff-buffer)))
+  (when-let ((diff-buf (map-nested-elt state (list :tool-calls tool-call-id :diff-buffer))))
     (agent-shell-diff-kill-buffer diff-buf))
   ;; Ensure in the shell buffer for state operations, as this
   ;; function may be invoked from a viewport buffer.
@@ -5026,8 +5025,7 @@ ACTIONS as per `agent-shell--make-permission-action'."
   (let ((shell-buffer (current-buffer)))
     (lambda ()
       (interactive)
-      (if-let ((tool-data (map-elt (map-elt state :tool-calls) tool-call-id))
-               (existing (map-elt tool-data :diff-buffer))
+      (if-let ((existing (map-nested-elt state (list :tool-calls tool-call-id :diff-buffer)))
                ((buffer-live-p existing)))
           (pop-to-buffer existing '((display-buffer-reuse-window
                                      display-buffer-use-some-window
@@ -5085,8 +5083,10 @@ ACTIONS as per `agent-shell--make-permission-action'."
                            (message "Ignored"))))))
         ;; Track the diff buffer in tool-call state so it can be
         ;; cleaned up when the permission is resolved externally.
-        (when-let ((tool-data (map-elt (map-elt state :tool-calls) tool-call-id)))
-          (nconc tool-data (list (cons :diff-buffer diff-buffer)))))))))
+        (when-let ((tool-calls (map-elt state :tool-calls)))
+          (map-put! tool-calls tool-call-id
+                    (map-insert (map-elt tool-calls tool-call-id)
+                                :diff-buffer diff-buffer))))))))
 
 (cl-defun agent-shell--make-permission-button (&key text help action keymap navigatable char option)
   "Create a permission button with TEXT, HELP, ACTION, and KEYMAP.

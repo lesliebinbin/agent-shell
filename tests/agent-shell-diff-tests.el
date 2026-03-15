@@ -110,12 +110,11 @@
                      :state state
                      :tool-call-id "tc-1"))))
     (unwind-protect
-        (progn
-          (funcall view-fn)
-          (let ((diff-buf (map-elt tool-data :diff-buffer)))
-            (should (bufferp diff-buf))
-            (should (buffer-live-p diff-buf))))
-      (when-let ((diff-buf (map-elt tool-data :diff-buffer)))
+        (let ((diff-buf (progn (funcall view-fn)
+                               (map-nested-elt state '(:tool-calls "tc-1" :diff-buffer)))))
+          (should (bufferp diff-buf))
+          (should (buffer-live-p diff-buf)))
+      (when-let ((diff-buf (map-nested-elt state '(:tool-calls "tc-1" :diff-buffer))))
         (when (buffer-live-p diff-buf)
           (agent-shell-diff-kill-buffer diff-buf)))
       (when (buffer-live-p shell-buf)
@@ -124,10 +123,9 @@
 (ert-deftest agent-shell-diff-reuses-existing-buffer-test ()
   "Test that invoking the diff viewer twice reuses the same buffer."
   (let* ((shell-buf (generate-new-buffer " *test-shell*"))
-         (tool-data (list (cons :status "pending")))
          (state (list (cons :buffer shell-buf)
                       (cons :tool-calls
-                            (list (cons "tc-1" tool-data)))))
+                            (list (cons "tc-1" (list (cons :status "pending")))))))
          (diff (list (cons :old "hello\n")
                      (cons :new "world\n")
                      (cons :file "test.el")))
@@ -143,11 +141,11 @@
     (unwind-protect
         (progn
           (funcall view-fn)
-          (let ((first-buf (map-elt tool-data :diff-buffer)))
+          (let ((first-buf (map-nested-elt state '(:tool-calls "tc-1" :diff-buffer))))
             (should (buffer-live-p first-buf))
             (funcall view-fn)
-            (should (eq first-buf (map-elt tool-data :diff-buffer)))))
-      (when-let ((diff-buf (map-elt tool-data :diff-buffer)))
+            (should (eq first-buf (map-nested-elt state '(:tool-calls "tc-1" :diff-buffer))))))
+      (when-let ((diff-buf (map-nested-elt state '(:tool-calls "tc-1" :diff-buffer))))
         (when (buffer-live-p diff-buf)
           (agent-shell-diff-kill-buffer diff-buf)))
       (when (buffer-live-p shell-buf)
