@@ -3204,10 +3204,24 @@ BINDINGS is a list of alists defining key bindings to display, each with:
                               (propertize (concat (map-elt header-model :buffer-name) " Agent")
                                           'font-lock-face 'font-lock-variable-name-face)
                               (if (map-elt header-model :model-name)
-                                  (concat " ➤ " (propertize (map-elt header-model :model-name) 'font-lock-face 'font-lock-negation-char-face))
+                                  (concat " ➤ " (propertize (map-elt header-model :model-name)
+                                                            'font-lock-face 'font-lock-negation-char-face
+                                                            'help-echo "Click to open LLM model menu"
+                                                            'mouse-face 'mode-line-highlight
+                                                            'local-map (let ((map (make-sparse-keymap)))
+                                                                         (define-key map [header-line mouse-1]
+                                                                                     (agent-shell--mode-line-model-menu))
+                                                                         map)))
                                 "")
                               (if (map-elt header-model :mode-name)
-                                  (concat " ➤ " (propertize (map-elt header-model :mode-name) 'font-lock-face 'font-lock-type-face))
+                                  (concat " ➤ " (propertize (map-elt header-model :mode-name)
+                                                            'font-lock-face 'font-lock-type-face
+                                                            'help-echo "Click to open session mode menu"
+                                                            'mouse-face 'mode-line-highlight
+                                                            'local-map (let ((map (make-sparse-keymap)))
+                                                                         (define-key map [header-line mouse-1]
+                                                                                     (agent-shell--mode-line-mode-menu))
+                                                                         map)))
                                 "")
                               (propertize (map-elt header-model :project-name) 'font-lock-face 'font-lock-string-face)
                               (if (map-elt header-model :session-id)
@@ -6125,18 +6139,79 @@ See https://agentclientprotocol.com/protocol/session-modes for details."
               (value (map-nested-elt (agent-shell--state) '(:heartbeat :value))))
     (concat " " (seq-elt frames (mod value (length frames))))))
 
+(defun agent-shell--mode-line-model-menu ()
+  "Build a menu keymap for selecting a model from the mode line.
+
+For example: clicking \"[Sonnet]\" shows a popup with all available models."
+  (let ((menu (make-sparse-keymap "LLM model"))
+        (shell-buffer (agent-shell--shell-buffer)))
+    (seq-do
+     (lambda (model)
+       (define-key menu (vector (intern (concat "model-" (map-elt model :model-id))))
+                   `(menu-item ,(map-elt model :name)
+                               (lambda () (interactive)
+                                 (with-current-buffer ,shell-buffer
+                                   (agent-shell--send-request
+                                    :state (agent-shell--state)
+                                    :client (map-elt (agent-shell--state) :client)
+                                    :request (acp-make-session-set-model-request
+                                              :session-id (map-nested-elt (agent-shell--state) '(:session :id))
+                                              :model-id ,(map-elt model :model-id))
+                                    :on-success (lambda (_acp-response)
+                                                  (map-put! (map-elt (agent-shell--state) :session)
+                                                            :model-id ,(map-elt model :model-id))
+                                                  (message "Model: %s" ,(map-elt model :name))
+                                                  (agent-shell--update-header-and-mode-line))
+                                    :on-failure (lambda (acp-error _raw-message)
+                                                  (message "Failed to change model: %s" acp-error)))))
+                               :button (:toggle . ,(string= (map-elt model :model-id)
+                                                            (map-nested-elt (agent-shell--state) '(:session :model-id)))))))
+     (reverse (map-nested-elt (agent-shell--state) '(:session :models))))
+    menu))
+
+(defun agent-shell--mode-line-mode-menu ()
+  "Build a menu keymap for selecting a session mode from the mode line.
+
+For example: clicking \"[Accept Edits]\" shows a popup with all available modes."
+  (let ((menu (make-sparse-keymap "Session mode"))
+        (shell-buffer (agent-shell--shell-buffer)))
+    (seq-do
+     (lambda (mode)
+       (define-key menu (vector (intern (concat "mode-" (map-elt mode :id))))
+                   `(menu-item ,(map-elt mode :name)
+                               (lambda () (interactive)
+                                 (with-current-buffer ,shell-buffer
+                                   (agent-shell--send-request
+                                    :state (agent-shell--state)
+                                    :client (map-elt (agent-shell--state) :client)
+                                    :request (acp-make-session-set-mode-request
+                                              :session-id (map-nested-elt (agent-shell--state) '(:session :id))
+                                              :mode-id ,(map-elt mode :id))
+                                    :buffer ,shell-buffer
+                                    :on-success (lambda (_acp-response)
+                                                  (map-put! (map-elt (agent-shell--state) :session)
+                                                            :mode-id ,(map-elt mode :id))
+                                                  (message "Session mode: %s" ,(map-elt mode :name))
+                                                  (agent-shell--update-header-and-mode-line))
+                                    :on-failure (lambda (acp-error _raw-message)
+                                                  (message "Failed to change session mode: %s" acp-error)))))
+                               :button (:toggle . ,(string= (map-elt mode :id)
+                                                            (map-nested-elt (agent-shell--state) '(:session :mode-id)))))))
+     (reverse (agent-shell--get-available-modes (agent-shell--state))))
+    menu))
+
 (defun agent-shell--mode-line-format ()
   "Return `agent-shell''s mode-line format.
 
 Typically includes the container indicator, model, session mode and activity
 or nil if unavailable.
 
-For example: \" [C] [Sonnet] [Accept Edits] ░░░ \".
-Shows \" [C]\" when a command prefix is used."
+For example: \" ⧉ ➤ Sonnet ➤ Accept Edits ░░░ \".
+Shows \" ⧉\" when a command prefix is used."
   (when-let* (((derived-mode-p 'agent-shell-mode))
-              ((memq agent-shell-header-style '(text none nil))))
+              ((memq agent-shell-header-style '(none nil))))
     (concat (when agent-shell-command-prefix
-              (propertize " [C]"
+              (propertize " ⧉ ➤"
                           'face 'font-lock-constant-face
                           'help-echo "Running in container"))
             (when-let ((model-name (or (map-elt (seq-find (lambda (model)
@@ -6145,17 +6220,27 @@ Shows \" [C]\" when a command prefix is used."
                                                           (map-nested-elt (agent-shell--state) '(:session :models)))
                                                 :name)
                                        (map-nested-elt (agent-shell--state) '(:session :model-id)))))
-              (propertize (format " [%s]" model-name)
-                          'face 'font-lock-variable-name-face
-                          'help-echo (format "Model: %s" model-name)))
+              (concat " " (propertize model-name
+                                      'face 'font-lock-negation-char-face
+                                      'help-echo "Click to open LLM model menu"
+                                      'mouse-face 'mode-line-highlight
+                                      'local-map (let ((map (make-sparse-keymap)))
+                                                   (define-key map [mode-line mouse-1]
+                                                               (agent-shell--mode-line-model-menu))
+                                                   map))))
             (when-let ((mode-name (agent-shell--resolve-session-mode-name
                                    (map-nested-elt (agent-shell--state) '(:session :mode-id))
                                    (agent-shell--get-available-modes (agent-shell--state)))))
-              (propertize (format " [%s]" mode-name)
-                          'face 'font-lock-type-face
-                          'help-echo (format "Session Mode: %s" mode-name)))
+              (concat " ➤ " (propertize mode-name
+                                        'face 'font-lock-type-face
+                                        'help-echo "Click to open session mode menu"
+                                        'mouse-face 'mode-line-highlight
+                                        'local-map (let ((map (make-sparse-keymap)))
+                                                     (define-key map [mode-line mouse-1]
+                                                                 (agent-shell--mode-line-mode-menu))
+                                                     map))))
             (when-let ((indicator (agent-shell--context-usage-indicator)))
-              (concat " " indicator))
+              (concat " ➤ " indicator))
             (agent-shell--busy-indicator-frame))))
 
 (defun agent-shell--setup-modeline ()
